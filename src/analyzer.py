@@ -53,14 +53,24 @@ def report_to_dict(report: DetectionReport) -> dict:
             "confidence": round(cell.confidence, 4),
             "center_lat": round(cell.center_lat, 4),
             "center_lon": round(cell.center_lon, 4),
+            # ADS-B indicators
             "total_aircraft": cell.total_aircraft,
             "adsb_count": cell.adsb_count,
             "mlat_count": cell.mlat_count,
-            "mlat_ratio": round(cell.mlat_ratio, 4),
+            "asterix_count": cell.asterix_count,
+            "non_gps_ratio": round(cell.non_gps_ratio, 4),
+            "non_gps_ratio_adj": round(cell.non_gps_ratio_adj, 4),
+            "alt_variance_m": round(cell.alt_variance_m, 1),
             "mean_alt_diff_m": round(cell.mean_alt_diff_m, 1),
             "max_alt_diff_m": round(cell.max_alt_diff_m, 1),
-            "mlat_score": round(cell.mlat_score, 4),
-            "alt_score": round(cell.alt_score, 4),
+            "pos_stale_ratio": round(cell.pos_stale_ratio, 4),
+            "mean_cruise_alt_m": round(cell.mean_cruise_alt_m, 0),
+            # Scores
+            "non_gps_score": round(cell.non_gps_score, 4),
+            "alt_variance_score": round(cell.alt_variance_score, 4),
+            "alt_mean_score": round(cell.alt_mean_score, 4),
+            "pos_stale_score": round(cell.pos_stale_score, 4),
+            # Cell layer
             "total_towers": cell.total_towers,
             "mean_cell_range_m": round(cell.mean_cell_range_m, 1),
             "cell_score": round(cell.cell_score, 4),
@@ -124,19 +134,16 @@ def print_summary(report: DetectionReport, use_color: bool = True) -> None:
     print(f"\n  Flagged zones ({len(report.flagged_cells)} cells):\n")
     for cell in sorted(report.flagged_cells, key=lambda c: c.confidence, reverse=True):
         badge = color(cell.level, f"[{cell.level:<8}]")
-        src   = f"[{cell.source_label:<13}]"
         adsb_part = (
-            f"mlat={cell.mlat_ratio:.0%}({cell.mlat_count}/{cell.total_aircraft}) "
-            f"Δalt={cell.mean_alt_diff_m:.0f}m"
+            f"nonGPS={cell.non_gps_ratio_adj:.0%}({cell.non_gps_count}/{cell.total_aircraft}) "
+            f"AltVar={cell.alt_variance_m:.0f}m "
+            f"Δalt={cell.mean_alt_diff_m:.0f}m "
+            f"stale={cell.pos_stale_ratio:.0%}"
         ) if cell.has_adsb else ""
-        cell_part = (
-            f"CellRange={cell.mean_cell_range_m:.0f}m"
-        ) if cell.has_cell else ""
+        cell_part = f"CellRange={cell.mean_cell_range_m:.0f}m" if cell.has_cell else ""
         print(
-            f"  {badge} {src} "
-            f"({cell.center_lat:+.2f}, {cell.center_lon:+.2f})  "
-            f"conf={cell.confidence:.2%}  "
-            f"{adsb_part}  {cell_part}"
+            f"  {badge} ({cell.center_lat:+.2f}, {cell.center_lon:+.2f})  "
+            f"conf={cell.confidence:.2%}  {adsb_part}  {cell_part}"
         )
     print()
 

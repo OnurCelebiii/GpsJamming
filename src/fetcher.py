@@ -147,6 +147,44 @@ class OpenSkyFetcher:
         logger.info("Snapshot cached → %s", cache_path)
         return df
 
+    def fetch_multi(
+        self,
+        n: int = config.MULTI_SNAPSHOT_COUNT,
+        bbox: Optional[tuple[float, float, float, float]] = None,
+        cache_dir: str = config.DATA_CACHE_DIR,
+    ) -> pd.DataFrame:
+        """
+        Fetch `n` consecutive snapshots and return a merged DataFrame.
+
+        Merging multiple snapshots:
+        - Increases the number of aircraft observations per grid cell
+        - Stabilises MLAT/non-GPS ratios (reduces single-snapshot noise)
+        - Improves altitude variance computation (more samples per cell)
+
+        The `fetch_time` column is preserved per-row so the detector can
+        distinguish snapshots if needed.
+        """
+        frames: list[pd.DataFrame] = []
+        for i in range(n):
+            logger.info("Snapshot %d/%d …", i + 1, n)
+            df = self.fetch_and_cache(bbox=bbox, cache_dir=cache_dir)
+            if not df.empty:
+                frames.append(df)
+            if i < n - 1:
+                self._rate_limit_wait()
+
+        if not frames:
+            logger.error("All %d snapshot attempts returned empty.", n)
+            return pd.DataFrame(columns=COLUMNS)
+
+        merged = pd.concat(frames, ignore_index=True)
+        logger.info(
+            "Merged %d snapshots → %d total records (%d unique aircraft)",
+            len(frames), len(merged),
+            merged["icao24"].nunique() if "icao24" in merged.columns else 0,
+        )
+        return merged
+
     @staticmethod
     def load_cached(path: str) -> pd.DataFrame:
         """Load a previously cached JSON snapshot into a DataFrame."""

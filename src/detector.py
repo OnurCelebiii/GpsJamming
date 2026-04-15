@@ -1,43 +1,42 @@
 """
-GPS Jamming Detection Engine — dual-source (ADS-B + Cell towers).
+GPS Jamming Detection Engine — 5-indicator dual-source system.
 
-Detection methodology
----------------------
+Why 5 indicators?
+-----------------
+Single-indicator systems (MLAT ratio alone) miss:
+  • GPS SPOOFING  — aircraft keeps ADS-B GPS (source=0) but reports a false
+    position. MLAT ratio stays 0 but altitude variance spikes.
+  • GPS DROPOUT   — aircraft position timestamp stops updating while
+    last_contact continues. Position staleness ratio rises.
+  • RADAR OVERRIDE (ASTERIX) — military radar overwrites GPS in conflict
+    zones. Counted as non-GPS along with MLAT.
+  • CRUISE-ALTITUDE anomalies — MLAT at FL300 is almost never normal.
 
-Source A — ADS-B (OpenSky Network, airborne layer):
-  1. MLAT-ratio indicator
-     Aircraft that lose GPS lock fall back to MLAT (position_source=2).
-     A cell with too many MLAT aircraft signals airborne GPS disruption.
+The 5 indicators
+----------------
+1. Non-GPS ratio          (MLAT source=2 + ASTERIX source=1) / total
+   Primary indicator.  High-altitude multiplier applied for cruise flights.
+   Weight: 40 %
 
-  2. Barometric / geometric altitude discrepancy
-     Jamming corrupts geo_altitude while baro_altitude (pressure) stays
-     stable.  Large |geo − baro| difference is a second airborne indicator.
+2. Altitude variance      std_dev(geo_alt − baro_alt) within cell
+   Catches GPS spoofing: spoofed aircraft get wrong altitudes while
+   baro stays correct.  Normal std-dev < 50 m.
+   Weight: 30 %
 
-Source B — Cell towers (OpenCelliD, ground layer):
-  3. Cell tower GPS range indicator
-     OpenCelliD stores, per tower, the GPS error (`range` in metres) of the
-     phones that crowd-sourced it.  High average range in a grid cell = poor
-     phone GPS in that area = potential ground-level jamming.
+3. Mean altitude diff     mean |geo_alt − baro_alt| within cell
+   Secondary altitude check with raised scale (2000 m = ALERT).
+   A 4000 m discrepancy alone pushes to ALERT level.
+   Weight: 20 %
 
-     This fills blind spots where no aircraft fly (sea level, terrain,
-     restricted airspace).
-
-Composite confidence score
---------------------------
-  conf = w_mlat  * mlat_score
-       + w_alt   * alt_score
-       + w_cell  * cell_score
-
-  Weights adapt based on data availability:
-    - Both sources   → 42 % MLAT + 28 % alt + 30 % cell
-    - ADS-B only     → 60 % MLAT + 40 % alt
-    - Cell only      → 100 % cell
+4. Position staleness     fraction where last_contact − time_position > 30 s
+   GPS signal lost but ADS-B transmitter still active.
+   Weight: 10 %
 
 References
 ----------
-  Mitch et al. (2011), "Signal Characteristics of Civil GPS Jammers". ION GNSS.
-  Shepard et al. (2012), "GPS Spoofing Attack Evaluation". ION GNSS.
-  OpenCelliD documentation: https://opencellid.org/
+  EASA SIB 2022-02R2 "GPS/GNSS jamming and spoofing"
+  ICAO Cir 344 "Global Navigation Satellite System (GNSS) Manual"
+  Mitch et al. (2011) ION GNSS — signal characteristics of civil GPS jammers
 """
 
 from __future__ import annotations
@@ -46,6 +45,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -59,41 +59,47 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CellResult:
-    """Detection result for one geographic grid cell (both sources)."""
-
     lat_min: float
     lat_max: float
     lon_min: float
     lon_max: float
 
-    # --- ADS-B layer ---
+    # ADS-B counts
     total_aircraft: int = 0
-    adsb_count: int = 0
-    mlat_count: int = 0
+    adsb_count: int = 0       # source = 0
+    mlat_count: int = 0       # source = 2
+    asterix_count: int = 0    # source = 1
     other_count: int = 0
-    mlat_ratio: float = 0.0
-    mean_alt_diff_m: float = 0.0
-    max_alt_diff_m: float = 0.0
-    mlat_score: float = 0.0
-    alt_score: float = 0.0
-    has_adsb: bool = False
+    non_gps_count: int = 0    # mlat + asterix
 
-    # --- Cell tower layer ---
+    # Indicator values (raw)
+    non_gps_ratio: float = 0.0         # (mlat + asterix) / total
+    non_gps_ratio_adj: float = 0.0     # after high-altitude multiplier
+    alt_variance_m: float = 0.0        # std-dev of (geo-baro) diff
+    mean_alt_diff_m: float = 0.0       # mean |geo-baro|
+    max_alt_diff_m: float = 0.0
+    pos_stale_ratio: float = 0.0       # fraction with stale GPS
+    mean_cruise_alt_m: float = 0.0     # mean altitude of cell aircraft
+
+    # Indicator scores [0, 1]
+    non_gps_score: float = 0.0
+    alt_variance_score: float = 0.0
+    alt_mean_score: float = 0.0
+    pos_stale_score: float = 0.0
+
+    # Cell layer (OpenCelliD)
     total_towers: int = 0
-    mean_cell_range_m: float = 0.0   # average GPS error when towers were measured
+    mean_cell_range_m: float = 0.0
     max_cell_range_m: float = 0.0
     cell_score: float = 0.0
     has_cell: bool = False
 
-    # --- Composite ---
+    has_adsb: bool = False
     confidence: float = 0.0
     level: str = "CLEAR"
 
-    # Representative location
     center_lat: float = 0.0
     center_lon: float = 0.0
-
-    # Affected aircraft ICAO24 identifiers
     affected_aircraft: list = field(default_factory=list)
 
     @property
@@ -109,17 +115,18 @@ class CellResult:
 
     @property
     def source_label(self) -> str:
-        if self.has_adsb and self.has_cell:
-            return "ADS-B + Cell"
+        parts = []
         if self.has_adsb:
-            return "ADS-B"
-        return "Cell"
+            parts.append("ADS-B")
+        if self.has_cell:
+            parts.append("Cell")
+        return " + ".join(parts) if parts else "?"
 
 
 @dataclass
 class DetectionReport:
-    """Aggregated detection report for an entire snapshot."""
     fetch_time: Optional[str] = None
+    snapshots_merged: int = 1
     total_aircraft_analyzed: int = 0
     total_towers_analyzed: int = 0
     total_cells_analyzed: int = 0
@@ -139,18 +146,19 @@ class DetectionReport:
 
 
 # ---------------------------------------------------------------------------
-# Main detector
+# Detector
 # ---------------------------------------------------------------------------
 
 class JammingDetector:
     """
-    Detects GPS jamming zones from ADS-B and/or cell tower DataFrames.
+    Detects GPS jamming/spoofing zones using 5 independent ADS-B indicators
+    plus an optional ground-level cell tower GPS quality indicator.
 
     Usage
     -----
     detector = JammingDetector()
-    report   = detector.analyze(adsb_df)                     # ADS-B only
-    report   = detector.analyze(adsb_df, cell_df=cell_df)    # both sources
+    report   = detector.analyze(adsb_df)
+    report   = detector.analyze(adsb_df, cell_df=cell_df)
     """
 
     def __init__(
@@ -159,7 +167,7 @@ class JammingDetector:
         min_aircraft: int = config.GRID_MIN_AIRCRAFT,
         min_towers: int = config.CELL_MIN_TOWERS,
     ) -> None:
-        self._cell_deg    = cell_deg
+        self._cell_deg     = cell_deg
         self._min_aircraft = min_aircraft
         self._min_towers   = min_towers
 
@@ -171,18 +179,10 @@ class JammingDetector:
         self,
         adsb_df: pd.DataFrame,
         cell_df: Optional[pd.DataFrame] = None,
+        snapshots_merged: int = 1,
     ) -> DetectionReport:
-        """
-        Run full detection pipeline.
+        report = DetectionReport(snapshots_merged=snapshots_merged)
 
-        Parameters
-        ----------
-        adsb_df  : output of OpenSkyFetcher.fetch_all_states()
-        cell_df  : output of CellFetcher.fetch_bbox()  (optional)
-        """
-        report = DetectionReport()
-
-        # Pre-process ADS-B
         airborne = pd.DataFrame()
         if not adsb_df.empty:
             airborne = adsb_df[
@@ -190,55 +190,47 @@ class JammingDetector:
                 adsb_df["latitude"].notna() &
                 adsb_df["longitude"].notna()
             ].copy()
-            airborne["cell_lat"] = self._grid_bin(airborne["latitude"])
-            airborne["cell_lon"] = self._grid_bin(airborne["longitude"])
+            airborne["_cell_lat"] = self._grid_bin(airborne["latitude"])
+            airborne["_cell_lon"] = self._grid_bin(airborne["longitude"])
             report.total_aircraft_analyzed = len(airborne)
-            if "fetch_time" in adsb_df.columns:
+            if "fetch_time" in adsb_df.columns and not adsb_df["fetch_time"].isna().all():
                 report.fetch_time = str(adsb_df["fetch_time"].iloc[0])
 
-        # Pre-process cell towers
         cells_valid = pd.DataFrame()
         if cell_df is not None and not cell_df.empty:
             cells_valid = cell_df[
-                cell_df["latitude"].notna() &
-                cell_df["longitude"].notna()
+                cell_df["latitude"].notna() & cell_df["longitude"].notna()
             ].copy()
-            cells_valid["cell_lat"] = self._grid_bin(cells_valid["latitude"])
-            cells_valid["cell_lon"] = self._grid_bin(cells_valid["longitude"])
+            cells_valid["_cell_lat"] = self._grid_bin(cells_valid["latitude"])
+            cells_valid["_cell_lon"] = self._grid_bin(cells_valid["longitude"])
             report.total_towers_analyzed = len(cells_valid)
 
         logger.info(
-            "Analyzing %d airborne aircraft + %d cell towers",
-            len(airborne), len(cells_valid),
+            "Analyzing %d airborne aircraft + %d cell towers across %.1f° grid",
+            len(airborne), len(cells_valid), self._cell_deg,
         )
 
-        # Build union of all grid keys present in either source
         grid_keys: set[tuple] = set()
         if not airborne.empty:
-            grid_keys |= set(zip(airborne["cell_lat"], airborne["cell_lon"]))
+            grid_keys |= set(zip(airborne["_cell_lat"], airborne["_cell_lon"]))
         if not cells_valid.empty:
-            grid_keys |= set(zip(cells_valid["cell_lat"], cells_valid["cell_lon"]))
+            grid_keys |= set(zip(cells_valid["_cell_lat"], cells_valid["_cell_lon"]))
 
         results: list[CellResult] = []
         for (clat, clon) in grid_keys:
-            ac_group   = airborne[
-                (airborne["cell_lat"] == clat) & (airborne["cell_lon"] == clon)
-            ] if not airborne.empty else pd.DataFrame()
-
-            cell_group = cells_valid[
-                (cells_valid["cell_lat"] == clat) & (cells_valid["cell_lon"] == clon)
-            ] if not cells_valid.empty else pd.DataFrame()
-
-            # Skip if neither source has enough data
-            enough_ac   = len(ac_group) >= self._min_aircraft
-            enough_cell = len(cell_group) >= self._min_towers
-            if not enough_ac and not enough_cell:
+            ac_g = (
+                airborne[(airborne["_cell_lat"] == clat) & (airborne["_cell_lon"] == clon)]
+                if not airborne.empty else pd.DataFrame()
+            )
+            ce_g = (
+                cells_valid[(cells_valid["_cell_lat"] == clat) & (cells_valid["_cell_lon"] == clon)]
+                if not cells_valid.empty else pd.DataFrame()
+            )
+            if len(ac_g) < self._min_aircraft and len(ce_g) < self._min_towers:
                 continue
+            results.append(self._analyze_cell(clat, clon, ac_g, ce_g))
 
-            result = self._analyze_cell(clat, clon, ac_group, cell_group)
-            results.append(result)
-
-        report.cell_results    = results
+        report.cell_results         = results
         report.total_cells_analyzed = len(results)
         report.clear_cells    = sum(1 for c in results if c.level == "CLEAR")
         report.warning_cells  = sum(1 for c in results if c.level == "WARNING")
@@ -246,11 +238,10 @@ class JammingDetector:
         report.critical_cells = sum(1 for c in results if c.level == "CRITICAL")
 
         logger.info(
-            "Detection complete — %d cells | %dW %dA %dC",
+            "Detection complete — %d cells | %dW %dA %dC | peak conf %.0f%%",
             report.total_cells_analyzed,
-            report.warning_cells,
-            report.alert_cells,
-            report.critical_cells,
+            report.warning_cells, report.alert_cells, report.critical_cells,
+            report.highest_confidence * 100,
         )
         return report
 
@@ -262,108 +253,149 @@ class JammingDetector:
         self,
         cell_lat: float,
         cell_lon: float,
-        ac_group: pd.DataFrame,
-        cell_group: pd.DataFrame,
+        ac: pd.DataFrame,
+        ce: pd.DataFrame,
     ) -> CellResult:
-        result = CellResult(
-            lat_min=cell_lat,
-            lat_max=cell_lat + self._cell_deg,
-            lon_min=cell_lon,
-            lon_max=cell_lon + self._cell_deg,
+        r = CellResult(
+            lat_min=cell_lat, lat_max=cell_lat + self._cell_deg,
+            lon_min=cell_lon, lon_max=cell_lon + self._cell_deg,
         )
 
-        # Centroid from whichever source(s) are available
         lats, lons = [], []
 
-        # --- ADS-B indicators ---
-        if len(ac_group) >= self._min_aircraft:
-            result.has_adsb       = True
-            result.total_aircraft = len(ac_group)
-            result.adsb_count     = int((ac_group["position_source"] == 0).sum())
-            result.mlat_count     = int((ac_group["position_source"] == 2).sum())
-            result.other_count    = result.total_aircraft - result.adsb_count - result.mlat_count
-            result.mlat_ratio     = result.mlat_count / result.total_aircraft
-            result.mlat_score     = self._score_mlat(result.mlat_ratio)
+        # ----------------------------------------------------------------
+        # ADS-B indicators
+        # ----------------------------------------------------------------
+        if len(ac) >= self._min_aircraft:
+            r.has_adsb        = True
+            r.total_aircraft  = len(ac)
+            r.adsb_count      = int((ac["position_source"] == 0).sum())
+            r.mlat_count      = int((ac["position_source"] == 2).sum())
+            r.asterix_count   = int((ac["position_source"] == 1).sum())
+            r.non_gps_count   = r.mlat_count + r.asterix_count
+            r.other_count     = r.total_aircraft - r.adsb_count - r.non_gps_count
 
-            valid_alt = ac_group[
-                ac_group["baro_altitude"].notna() & ac_group["geo_altitude"].notna()
-            ]
-            if len(valid_alt) >= 2:
-                diff = (valid_alt["geo_altitude"] - valid_alt["baro_altitude"]).abs()
-                result.mean_alt_diff_m = float(diff.mean())
-                result.max_alt_diff_m  = float(diff.max())
-            result.alt_score = self._score_alt_diff(result.mean_alt_diff_m)
+            r.affected_aircraft = ac["icao24"].dropna().tolist()
+            lats.extend(ac["latitude"].dropna().tolist())
+            lons.extend(ac["longitude"].dropna().tolist())
 
-            result.affected_aircraft = ac_group["icao24"].dropna().tolist()
-            lats.extend(ac_group["latitude"].dropna().tolist())
-            lons.extend(ac_group["longitude"].dropna().tolist())
+            # --- Indicator 1: Non-GPS ratio with high-altitude multiplier ---
+            r.non_gps_ratio = r.non_gps_count / r.total_aircraft
 
-        # --- Cell tower indicator ---
-        if len(cell_group) >= self._min_towers:
-            result.has_cell       = True
-            result.total_towers   = len(cell_group)
-            ranges = cell_group["range"].dropna()
+            # For high-altitude aircraft, non-GPS is a much stronger signal.
+            # Compute mean altitude of aircraft in cell that ARE non-GPS.
+            if r.non_gps_count > 0 and "baro_altitude" in ac.columns:
+                non_gps_ac = ac[ac["position_source"].isin([1, 2])]
+                mean_alt = non_gps_ac["baro_altitude"].dropna().mean()
+                r.mean_cruise_alt_m = float(mean_alt) if not np.isnan(mean_alt) else 0.0
+                multiplier = config.HIGH_ALT_MULTIPLIER if r.mean_cruise_alt_m >= config.HIGH_ALT_M else 1.0
+            else:
+                multiplier = 1.0
+
+            r.non_gps_ratio_adj = min(1.0, r.non_gps_ratio * multiplier)
+            r.non_gps_score     = self._score_linear(
+                r.non_gps_ratio_adj,
+                config.NON_GPS_RATIO_WARN, config.NON_GPS_RATIO_ALERT,
+            )
+
+            # --- Indicator 2: Altitude variance ---
+            alt_pair = ac[ac["baro_altitude"].notna() & ac["geo_altitude"].notna()].copy()
+            if len(alt_pair) >= 3:
+                diff_series = alt_pair["geo_altitude"] - alt_pair["baro_altitude"]
+                r.alt_variance_m   = float(diff_series.std())
+                r.mean_alt_diff_m  = float(diff_series.abs().mean())
+                r.max_alt_diff_m   = float(diff_series.abs().max())
+            elif len(alt_pair) >= 2:
+                diff_series = alt_pair["geo_altitude"] - alt_pair["baro_altitude"]
+                r.mean_alt_diff_m = float(diff_series.abs().mean())
+                r.max_alt_diff_m  = float(diff_series.abs().max())
+                r.alt_variance_m  = 0.0
+
+            r.alt_variance_score = self._score_linear(
+                r.alt_variance_m,
+                config.ALT_VARIANCE_WARN_M, config.ALT_VARIANCE_ALERT_M,
+            )
+
+            # --- Indicator 3: Mean altitude discrepancy ---
+            r.alt_mean_score = self._score_linear(
+                r.mean_alt_diff_m,
+                config.ALT_MEAN_WARN_M, config.ALT_MEAN_ALERT_M,
+            )
+
+            # --- Indicator 4: Position staleness ---
+            if "time_position" in ac.columns and "last_contact" in ac.columns:
+                tp = pd.to_numeric(ac["time_position"], errors="coerce")
+                lc = pd.to_numeric(ac["last_contact"],  errors="coerce")
+                valid_mask = tp.notna() & lc.notna()
+                if valid_mask.sum() >= 2:
+                    age = (lc[valid_mask] - tp[valid_mask])
+                    stale = (age > config.POS_STALE_THRESH_S).sum()
+                    r.pos_stale_ratio = float(stale) / valid_mask.sum()
+            r.pos_stale_score = self._score_linear(
+                r.pos_stale_ratio,
+                config.POS_STALE_WARN, config.POS_STALE_ALERT,
+            )
+
+        # ----------------------------------------------------------------
+        # Cell tower indicator
+        # ----------------------------------------------------------------
+        if len(ce) >= self._min_towers:
+            r.has_cell      = True
+            r.total_towers  = len(ce)
+            ranges = ce["range"].dropna() if "range" in ce.columns else pd.Series(dtype=float)
             if not ranges.empty:
-                result.mean_cell_range_m = float(ranges.mean())
-                result.max_cell_range_m  = float(ranges.max())
-            result.cell_score = self._score_cell_range(result.mean_cell_range_m)
+                r.mean_cell_range_m = float(ranges.mean())
+                r.max_cell_range_m  = float(ranges.max())
+            r.cell_score = self._score_linear(
+                r.mean_cell_range_m,
+                config.CELL_RANGE_NORMAL_M, config.CELL_RANGE_ALERT_M,
+            )
+            lats.extend(ce["latitude"].dropna().tolist())
+            lons.extend(ce["longitude"].dropna().tolist())
 
-            lats.extend(cell_group["latitude"].dropna().tolist())
-            lons.extend(cell_group["longitude"].dropna().tolist())
-
+        # ----------------------------------------------------------------
+        # Centroid & composite score
+        # ----------------------------------------------------------------
         if lats:
-            result.center_lat = float(sum(lats) / len(lats))
-            result.center_lon = float(sum(lons) / len(lons))
+            r.center_lat = float(sum(lats) / len(lats))
+            r.center_lon = float(sum(lons) / len(lons))
 
-        # --- Composite score ---
-        result.confidence = self._composite(result)
-        result.level      = self._classify(result.confidence)
-        return result
+        r.confidence = self._composite(r)
+        r.level      = self._classify(r.confidence)
+        return r
 
     # ------------------------------------------------------------------
-    # Scoring
+    # Composite scoring
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _score_mlat(ratio: float) -> float:
-        low, high = config.MLAT_RATIO_WARN, config.MLAT_RATIO_ALERT
-        if ratio <= low:  return 0.0
-        if ratio >= high: return 1.0
-        return (ratio - low) / (high - low)
-
-    @staticmethod
-    def _score_alt_diff(diff_m: float) -> float:
-        low, high = config.ALT_DIFF_WARN_M, config.ALT_DIFF_ALERT_M
-        if diff_m <= low:  return 0.0
-        if diff_m >= high: return 1.0
-        return (diff_m - low) / (high - low)
-
-    @staticmethod
-    def _score_cell_range(range_m: float) -> float:
-        """
-        Map mean cell tower GPS range → score.
-        Low range  (<150 m)  = good GPS  → 0.0
-        High range (>2000 m) = poor GPS  → 1.0
-        """
-        low  = config.CELL_RANGE_NORMAL_M
-        high = config.CELL_RANGE_ALERT_M
-        if range_m <= low:  return 0.0
-        if range_m >= high: return 1.0
-        return (range_m - low) / (high - low)
 
     @staticmethod
     def _composite(r: CellResult) -> float:
-        """
-        Weighted composite score — weights adapt to available sources.
-        """
         if r.has_adsb and r.has_cell:
-            cw = config.CELL_WEIGHT          # 0.30
-            aw = 1.0 - cw                    # 0.70  (split 60/40 → 42/28)
-            return aw * 0.60 * r.mlat_score + aw * 0.40 * r.alt_score + cw * r.cell_score
+            cw = config.CELL_WEIGHT            # 0.30
+            aw = 1.0 - cw                      # 0.70
+            adsb_part = (
+                config.W_NON_GPS   * r.non_gps_score +
+                config.W_ALT_VAR   * r.alt_variance_score +
+                config.W_ALT_MEAN  * r.alt_mean_score +
+                config.W_POS_STALE * r.pos_stale_score
+            )
+            return aw * adsb_part + cw * r.cell_score
+
         if r.has_adsb:
-            return 0.60 * r.mlat_score + 0.40 * r.alt_score
+            return (
+                config.W_NON_GPS   * r.non_gps_score +
+                config.W_ALT_VAR   * r.alt_variance_score +
+                config.W_ALT_MEAN  * r.alt_mean_score +
+                config.W_POS_STALE * r.pos_stale_score
+            )
         # cell only
         return r.cell_score
+
+    @staticmethod
+    def _score_linear(value: float, low: float, high: float) -> float:
+        if value <= low:  return 0.0
+        if value >= high: return 1.0
+        return (value - low) / (high - low)
 
     @staticmethod
     def _classify(confidence: float) -> str:
@@ -371,10 +403,6 @@ class JammingDetector:
         if confidence >= config.CONFIDENCE_ALERT:    return "ALERT"
         if confidence >= config.CONFIDENCE_WARN:     return "WARNING"
         return "CLEAR"
-
-    # ------------------------------------------------------------------
-    # Grid helpers
-    # ------------------------------------------------------------------
 
     def _grid_bin(self, series: pd.Series) -> pd.Series:
         return (series // self._cell_deg) * self._cell_deg
