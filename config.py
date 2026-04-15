@@ -68,6 +68,25 @@ CONFIDENCE_ALERT   = 0.65
 CONFIDENCE_CRITICAL = 0.80
 
 # ---------------------------------------------------------------------------
+# Cell tower GPS quality thresholds  (OpenCelliD)
+# ---------------------------------------------------------------------------
+
+# `range` field in OpenCelliD = GPS positioning error (metres) when the
+# tower was crowd-sourced.  Normal urban GPS accuracy is ~10–50 m.
+# High values indicate the phone had poor GPS when it measured that tower.
+CELL_RANGE_NORMAL_M  = 150    # baseline: good GPS quality
+CELL_RANGE_WARN_M    = 500    # elevated uncertainty
+CELL_RANGE_ALERT_M   = 2000   # severe GPS degradation
+
+# Minimum cell towers in a grid cell to include cell indicator
+CELL_MIN_TOWERS = 2
+
+# Weight of cell indicator in composite score when BOTH sources are available
+# (remaining weight goes to ADS-B indicators)
+# ADS-B weight = 1 - CELL_WEIGHT, split as before between mlat/alt
+CELL_WEIGHT = 0.30            # 30 % from cell data, 70 % from ADS-B
+
+# ---------------------------------------------------------------------------
 # Output / caching
 # ---------------------------------------------------------------------------
 DATA_CACHE_DIR  = "data"

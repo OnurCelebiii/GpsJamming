@@ -35,6 +35,7 @@ def report_to_dict(report: DetectionReport) -> dict:
         "fetch_time": report.fetch_time,
         "summary": {
             "total_aircraft_analyzed": report.total_aircraft_analyzed,
+            "total_towers_analyzed": report.total_towers_analyzed,
             "total_cells_analyzed": report.total_cells_analyzed,
             "clear_cells": report.clear_cells,
             "warning_cells": report.warning_cells,
@@ -47,6 +48,7 @@ def report_to_dict(report: DetectionReport) -> dict:
     for cell in sorted(report.flagged_cells, key=lambda c: c.confidence, reverse=True):
         d["flagged_cells"].append({
             "cell_id": cell.cell_id,
+            "source": cell.source_label,
             "level": cell.level,
             "confidence": round(cell.confidence, 4),
             "center_lat": round(cell.center_lat, 4),
@@ -59,7 +61,10 @@ def report_to_dict(report: DetectionReport) -> dict:
             "max_alt_diff_m": round(cell.max_alt_diff_m, 1),
             "mlat_score": round(cell.mlat_score, 4),
             "alt_score": round(cell.alt_score, 4),
-            "affected_aircraft": cell.affected_aircraft[:20],  # cap at 20 for readability
+            "total_towers": cell.total_towers,
+            "mean_cell_range_m": round(cell.mean_cell_range_m, 1),
+            "cell_score": round(cell.cell_score, 4),
+            "affected_aircraft": cell.affected_aircraft[:20],
         })
     return d
 
@@ -97,19 +102,20 @@ def print_summary(report: DetectionReport, use_color: bool = True) -> None:
             return f"{_LEVEL_COLORS.get(level, '')}{text}{_RESET}"
         return text
 
-    print("\n" + "=" * 65)
-    print("  GPS JAMMING DETECTION REPORT")
+    print("\n" + "=" * 70)
+    print("  GPS JAMMING DETECTION REPORT  (ADS-B + Cell/Phone)")
     if report.fetch_time:
-        print(f"  Snapshot time : {report.fetch_time}")
-    print("=" * 65)
-    print(f"  Aircraft analyzed : {report.total_aircraft_analyzed:>6}")
-    print(f"  Grid cells        : {report.total_cells_analyzed:>6}")
-    print(f"  CLEAR             : {color('CLEAR',    str(report.clear_cells)):>6}")
-    print(f"  WARNING           : {color('WARNING',  str(report.warning_cells)):>6}")
-    print(f"  ALERT             : {color('ALERT',    str(report.alert_cells)):>6}")
-    print(f"  CRITICAL          : {color('CRITICAL', str(report.critical_cells)):>6}")
-    print(f"  Highest confidence: {report.highest_confidence:.2%}")
-    print("=" * 65)
+        print(f"  Snapshot time  : {report.fetch_time}")
+    print("=" * 70)
+    print(f"  Aircraft analyzed  : {report.total_aircraft_analyzed:>6}")
+    print(f"  Cell towers        : {report.total_towers_analyzed:>6}")
+    print(f"  Grid cells         : {report.total_cells_analyzed:>6}")
+    print(f"  CLEAR              : {color('CLEAR',    str(report.clear_cells)):>6}")
+    print(f"  WARNING            : {color('WARNING',  str(report.warning_cells)):>6}")
+    print(f"  ALERT              : {color('ALERT',    str(report.alert_cells)):>6}")
+    print(f"  CRITICAL           : {color('CRITICAL', str(report.critical_cells)):>6}")
+    print(f"  Highest confidence : {report.highest_confidence:.2%}")
+    print("=" * 70)
 
     if not report.flagged_cells:
         print(color("CLEAR", "  No jamming detected in this snapshot.\n"))
@@ -118,12 +124,19 @@ def print_summary(report: DetectionReport, use_color: bool = True) -> None:
     print(f"\n  Flagged zones ({len(report.flagged_cells)} cells):\n")
     for cell in sorted(report.flagged_cells, key=lambda c: c.confidence, reverse=True):
         badge = color(cell.level, f"[{cell.level:<8}]")
+        src   = f"[{cell.source_label:<13}]"
+        adsb_part = (
+            f"mlat={cell.mlat_ratio:.0%}({cell.mlat_count}/{cell.total_aircraft}) "
+            f"Δalt={cell.mean_alt_diff_m:.0f}m"
+        ) if cell.has_adsb else ""
+        cell_part = (
+            f"CellRange={cell.mean_cell_range_m:.0f}m"
+        ) if cell.has_cell else ""
         print(
-            f"  {badge} "
+            f"  {badge} {src} "
             f"({cell.center_lat:+.2f}, {cell.center_lon:+.2f})  "
             f"conf={cell.confidence:.2%}  "
-            f"mlat={cell.mlat_ratio:.0%} ({cell.mlat_count}/{cell.total_aircraft})  "
-            f"Δalt={cell.mean_alt_diff_m:.0f}m"
+            f"{adsb_part}  {cell_part}"
         )
     print()
 
