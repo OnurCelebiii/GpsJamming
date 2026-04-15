@@ -3,46 +3,52 @@
 GPS Jamming Detection System — Main Entry Point
 ================================================
 
-Dual-source detection: ADS-B (OpenSky Network) + Cell towers (OpenCelliD).
+Dual-source, multi-snapshot GPS jamming and spoofing detection.
 
-Detection methodology
----------------------
-1. MLAT-ratio indicator (ADS-B)
-   Aircraft losing GPS lock switch from ADS-B (position_source=0) to MLAT
-   (position_source=2).  High MLAT fraction in a grid cell signals airborne
-   GPS disruption.
+Detection indicators (5 total)
+-------------------------------
+1. Non-GPS ratio       (MLAT source=2 + ASTERIX source=1) / total
+   High-altitude multiplier: non-GPS aircraft at cruise altitude
+   are a far stronger jamming signal than near airports.
 
-2. Barometric / geometric altitude discrepancy (ADS-B)
-   Jamming corrupts GNSS-derived geo_altitude while baro_altitude (pressure)
-   stays stable.  A large |geo − baro| is a second airborne indicator.
+2. Altitude variance   std_dev(geo_alt − baro_alt) within each cell.
+   Normal: all aircraft see the same geoid offset → low variance.
+   GPS spoofing: some aircraft get wrong altitudes → high variance.
+   Catches Israel/Iran-style SPOOFING that MLAT ratio misses.
 
-3. Cell tower GPS range indicator (OpenCelliD / phones)
-   OpenCelliD stores, per cell tower, the GPS positioning error of the phones
-   that crowd-sourced it.  High average `range` in a grid cell = poor phone
-   GPS = potential ground-level jamming.  This fills blind spots where no
-   aircraft fly (coastlines, terrain, restricted airspace).
+3. Mean altitude diff  mean |geo_alt − baro_alt| with raised scale
+   (200 m → warn, 2000 m → alert).  A 4000 m discrepancy now reaches
+   ALERT on its own.
 
-Composite confidence = 42 % MLAT + 28 % alt + 30 % cell  (when both available)
+4. Position staleness  fraction of aircraft where
+   last_contact − time_position > 30 s.
+   ADS-B still transmitting but GPS position not updating = GPS lost.
 
-Usage examples
---------------
-# ADS-B only (no OpenCelliD key):
+5. Cell GPS range      OpenCelliD crowd-sourced GPS positioning error
+   per cell tower.  Detects ground-level jamming where no aircraft fly.
+
+Usage
+-----
+# Single global snapshot (3 merged, anonymous):
     python main.py
 
-# ADS-B + cell towers (requires free OpenCelliD key):
-    OPENCELLID_KEY=mytoken python main.py
+# Bounding box (Israel / Middle East):
+    python main.py --bbox 28 25 42 55
 
-# Restrict to a bounding box (Middle East):
-    OPENCELLID_KEY=mytoken python main.py --bbox 28 25 42 55
+# Bounding box (Eastern Europe / Baltic):
+    python main.py --bbox 44 18 62 42
 
-# Continuous monitoring every 60 s for 2 hours:
-    OPENCELLID_KEY=mytoken python main.py --monitor --interval 60 --duration 7200
+# Continuous monitoring every 60 s:
+    python main.py --monitor --interval 60 --duration 7200
 
-# Authenticated OpenSky (higher rate limit):
-    OPENSKY_USER=user OPENSKY_PASS=pass python main.py
-
-# Load cached ADS-B snapshot:
+# Load cached snapshot:
     python main.py --from-cache data/opensky_20260415T041927Z.json
+
+# With OpenCelliD cell layer:
+    OPENCELLID_KEY=<token> python main.py
+
+# Authenticated OpenSky (faster polling):
+    OPENSKY_USER=user OPENSKY_PASS=pass python main.py
 """
 
 from __future__ import annotations
@@ -82,70 +88,60 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     src = p.add_mutually_exclusive_group()
     src.add_argument("--from-cache", metavar="PATH",
-                     help="Load cached OpenSky JSON snapshot instead of live API.")
+                     help="Load cached OpenSky JSON instead of live API.")
     src.add_argument("--monitor", action="store_true",
-                     help="Continuously poll OpenSky and accumulate trend data.")
+                     help="Continuously poll OpenSky.")
 
     p.add_argument("--bbox", nargs=4, type=float,
-                   metavar=("LAT_MIN", "LON_MIN", "LAT_MAX", "LON_MAX"),
-                   help="Restrict analysis to a geographic bounding box.")
-    p.add_argument("--interval", type=int, default=60,
-                   help="Polling interval in seconds for --monitor (default: 60).")
-    p.add_argument("--duration", type=int, default=0,
-                   help="Total monitoring duration in seconds, 0=forever (default: 0).")
+                   metavar=("LAT_MIN", "LON_MIN", "LAT_MAX", "LON_MAX"))
+    p.add_argument("--snapshots", type=int, default=config.MULTI_SNAPSHOT_COUNT,
+                   help=f"Snapshots to merge per run (default: {config.MULTI_SNAPSHOT_COUNT}).")
+    p.add_argument("--interval", type=int, default=60)
+    p.add_argument("--duration", type=int, default=0)
     p.add_argument("--cell-deg", type=float, default=config.GRID_CELL_DEG,
                    help=f"Grid cell size in degrees (default: {config.GRID_CELL_DEG}).")
-    p.add_argument("--min-aircraft", type=int, default=config.GRID_MIN_AIRCRAFT,
-                   help=f"Min aircraft per cell (default: {config.GRID_MIN_AIRCRAFT}).")
-    p.add_argument("--no-map",   action="store_true", help="Skip HTML map.")
-    p.add_argument("--no-chart", action="store_true", help="Skip PNG chart.")
-    p.add_argument("--show-all-cells", action="store_true",
-                   help="Draw CLEAR cells on the map too.")
-    p.add_argument("--output-dir", default=config.OUTPUT_DIR,
-                   help=f"Output directory (default: {config.OUTPUT_DIR}).")
-    p.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging.")
+    p.add_argument("--min-aircraft", type=int, default=config.GRID_MIN_AIRCRAFT)
+    p.add_argument("--no-map",   action="store_true")
+    p.add_argument("--no-chart", action="store_true")
+    p.add_argument("--show-all-cells", action="store_true")
+    p.add_argument("--output-dir", default=config.OUTPUT_DIR)
+    p.add_argument("--verbose", "-v", action="store_true")
     return p
 
 
 # ---------------------------------------------------------------------------
-# Single-snapshot run
+# Single run
 # ---------------------------------------------------------------------------
 
-def run_once(
-    sky_fetcher: OpenSkyFetcher,
-    cell_fetcher: CellFetcher,
-    detector: JammingDetector,
-    args: argparse.Namespace,
-) -> "DetectionReport":
+def run_once(sky: OpenSkyFetcher, cell: CellFetcher,
+             detector: JammingDetector, args: argparse.Namespace):
     import pandas as pd
 
-    # ADS-B
+    # ADS-B: merge multiple snapshots for stability
     if args.from_cache:
         adsb_df = OpenSkyFetcher.load_cached(args.from_cache)
+        snapshots = 1
     else:
         bbox = tuple(args.bbox) if args.bbox else None
-        adsb_df = sky_fetcher.fetch_and_cache(bbox=bbox)
+        adsb_df = sky.fetch_multi(n=args.snapshots, bbox=bbox)
+        snapshots = args.snapshots
 
     if adsb_df.empty:
-        logger.error("No ADS-B data received.")
+        logger.error("No ADS-B data — check network or OpenSky status.")
         from src.detector import DetectionReport
         return DetectionReport()
 
     # Cell towers
     cell_df = pd.DataFrame()
-    if cell_fetcher.available:
-        if args.bbox:
-            la1, lo1, la2, lo2 = args.bbox
-        else:
-            # Global: sample a coarse grid (keep API calls reasonable)
-            la1, lo1, la2, lo2 = -60.0, -180.0, 75.0, 180.0
-        cell_df = cell_fetcher.fetch_bbox(la1, lo1, la2, lo2)
-        if not cell_df.empty:
-            logger.info("Cell towers loaded: %d", len(cell_df))
-    else:
-        logger.info("Cell layer disabled (set OPENCELLID_KEY to enable).")
+    if cell.available:
+        la1, lo1, la2, lo2 = args.bbox if args.bbox else (-60, -180, 75, 180)
+        cell_df = cell.fetch_bbox(la1, lo1, la2, lo2)
 
-    report = detector.analyze(adsb_df, cell_df=cell_df if not cell_df.empty else None)
+    report = detector.analyze(
+        adsb_df,
+        cell_df=cell_df if not cell_df.empty else None,
+        snapshots_merged=snapshots,
+    )
     print_summary(report)
     save_report(report, output_dir=args.output_dir)
 
@@ -160,44 +156,33 @@ def run_once(
 
 
 # ---------------------------------------------------------------------------
-# Continuous monitoring
+# Monitoring loop
 # ---------------------------------------------------------------------------
 
-def run_monitor(
-    sky_fetcher: OpenSkyFetcher,
-    cell_fetcher: CellFetcher,
-    detector: JammingDetector,
-    args: argparse.Namespace,
-) -> None:
+def run_monitor(sky: OpenSkyFetcher, cell: CellFetcher,
+                detector: JammingDetector, args: argparse.Namespace):
     reports = []
-    start_ts = time.time()
-    poll_num = 0
-
-    logger.info("Monitoring started (interval=%ds, duration=%ds)",
-                args.interval, args.duration)
-
-    # Load cell data once per session (static dataset — refresh every 30 polls)
+    start   = time.time()
+    poll    = 0
     cell_df = None
-    cell_refresh_counter = 0
 
     while True:
-        poll_num += 1
-        logger.info("--- Poll #%d ---", poll_num)
+        poll += 1
+        logger.info("--- Poll #%d ---", poll)
 
         bbox = tuple(args.bbox) if args.bbox else None
-        adsb_df = sky_fetcher.fetch_and_cache(bbox=bbox)
+        adsb_df = sky.fetch_multi(n=args.snapshots, bbox=bbox)
 
-        # Refresh cell data every 30 polls (OpenCelliD data changes slowly)
-        if cell_fetcher.available and (cell_df is None or cell_refresh_counter >= 30):
-            la1, lo1, la2, lo2 = (args.bbox if args.bbox else (-60, -180, 75, 180))
-            if args.bbox:
-                la1, lo1, la2, lo2 = args.bbox
-            cell_df = cell_fetcher.fetch_bbox(la1, lo1, la2, lo2)
-            cell_refresh_counter = 0
-        cell_refresh_counter += 1
+        if cell.available and (cell_df is None or poll % 30 == 0):
+            la1, lo1, la2, lo2 = args.bbox if args.bbox else (-60, -180, 75, 180)
+            cell_df = cell.fetch_bbox(la1, lo1, la2, lo2)
 
         if not adsb_df.empty:
-            report = detector.analyze(adsb_df, cell_df=cell_df)
+            report = detector.analyze(
+                adsb_df,
+                cell_df=cell_df,
+                snapshots_merged=args.snapshots,
+            )
             print_summary(report)
             save_report(report, output_dir=args.output_dir)
             reports.append(report)
@@ -213,16 +198,15 @@ def run_monitor(
                 trend_df = build_trend_dataframe(reports)
                 build_trend_chart(trend_df,
                                   output_path=str(Path(args.output_dir) / "trend.png"))
-                hotspots = summarize_hotspots(reports, min_appearances=2)
-                if not hotspots.empty:
-                    logger.info("Persistent hotspots:\n%s", hotspots.to_string(index=False))
+                hs = summarize_hotspots(reports, min_appearances=2)
+                if not hs.empty:
+                    logger.info("Persistent hotspots:\n%s", hs.to_string(index=False))
 
-        elapsed = time.time() - start_ts
+        elapsed = time.time() - start
         if args.duration and elapsed >= args.duration:
-            logger.info("Duration limit reached. Stopping.")
             break
 
-        wait = max(sky_fetcher._interval, args.interval)
+        wait = max(sky._interval * args.snapshots, args.interval)
         logger.info("Next poll in %ds …", int(wait))
         time.sleep(wait)
 
@@ -231,26 +215,24 @@ def run_monitor(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main():
     parser = _build_parser()
     args   = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    sky_fetcher  = OpenSkyFetcher(
-        username=os.environ.get("OPENSKY_USER"),
-        password=os.environ.get("OPENSKY_PASS"),
-    )
-    cell_fetcher = CellFetcher(api_key=os.environ.get("OPENCELLID_KEY"))
-    detector     = JammingDetector(cell_deg=args.cell_deg, min_aircraft=args.min_aircraft)
+    sky      = OpenSkyFetcher(username=os.environ.get("OPENSKY_USER"),
+                               password=os.environ.get("OPENSKY_PASS"))
+    cell     = CellFetcher(api_key=os.environ.get("OPENCELLID_KEY"))
+    detector = JammingDetector(cell_deg=args.cell_deg, min_aircraft=args.min_aircraft)
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if args.monitor:
-        run_monitor(sky_fetcher, cell_fetcher, detector, args)
+        run_monitor(sky, cell, detector, args)
     else:
-        run_once(sky_fetcher, cell_fetcher, detector, args)
+        run_once(sky, cell, detector, args)
 
 
 if __name__ == "__main__":
